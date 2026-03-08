@@ -24,7 +24,7 @@ Telegram бот для менеджеров, позволяющий получа
 ### 1. Клонирование и настройка
 
 ```bash
-git clone https://github.com/GOFONCK/remnawave-ticket-bot.git
+git clone https://github.com/systemmaster1200-eng/remnawave-ticket-bot.git
 cd /opt/remnawave-ticket-bot
 cp .env.example .env
 ```
