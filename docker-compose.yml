@@ -1,0 +1,58 @@
+services:
+  remnawave-manager-bot:
+    build: .
+    container_name: remnawave-manager-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - payments_data:/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  remnawave-mini-app:
+    build: ./mini-app
+    container_name: remnawave-mini-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - payments_data:/data
+    expose:
+      - "8080"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    build: ./nginx
+    container_name: remnawave-nginx
+    restart: unless-stopped
+    depends_on:
+      - remnawave-mini-app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+    env_file:
+      - .env
+    environment:
+      - MINI_APP_DOMAIN=${MINI_APP_DOMAIN}
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  letsencrypt:
+  certbot_webroot:
+  payments_data:
