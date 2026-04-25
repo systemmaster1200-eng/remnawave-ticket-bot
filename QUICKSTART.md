@@ -14,12 +14,17 @@ nano .env  # или используйте любой редактор
 - `REMNAWAVE_API_URL` - URL API Remnawave (например: `https://api.example.com`)
 - `REMNAWAVE_API_TOKEN` - токен авторизации для API
 - `ALLOWED_MANAGER_IDS` - ID менеджеров через запятую (например: `123456789,987654321`)
+- `MINI_APP_DOMAIN` - домен мини-приложения и webhook
+- `USE_BUILTIN_NGINX=true|false` - использовать встроенный nginx с авто-SSL или внешний reverse proxy
+- `CERTBOT_EMAIL` - email для Let's Encrypt, нужен только если `USE_BUILTIN_NGINX=true`
 
 ## 2. Запуск через Docker Compose (рекомендуется)
 
 ```bash
-docker-compose up -d
+./compose.sh up -d --build
 ```
+
+Если `USE_BUILTIN_NGINX=false`, мини-приложение будет доступно на `127.0.0.1:8080`, а пример внешнего конфига лежит в `nginx/external.conf.example`.
 
 ## 3. Запуск через Docker
 
@@ -33,6 +38,7 @@ docker run -d --name remnawave-manager-bot --restart unless-stopped --env-file .
 ```bash
 # Просмотр логов
 docker logs remnawave-manager-bot
+docker logs remnawave-mini-app
 
 # Остановка
 docker stop remnawave-manager-bot

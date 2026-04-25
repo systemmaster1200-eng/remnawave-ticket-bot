@@ -37,8 +37,9 @@ cp .env.example .env
 - `REMNAWAVE_API_URL` - URL API Remnawave (например, `https://api.remnawave.example.com`)
 - `REMNAWAVE_API_TOKEN` - токен авторизации для API Remnawave
 - `ALLOWED_MANAGER_IDS` - список ID менеджеров через запятую (например, `123456789,987654321`)
-- `MINI_APP_DOMAIN` - домен мини-приложения (например, `mini.stealthnet.app` УТОЧНЕНИЕ - ставить на чистый сервер или рядом с панелью но тогда без мини апп) 
-- `CERTBOT_EMAIL` - email для Let's Encrypt (нужен для автоматического SSL при запуске nginx)
+- `MINI_APP_DOMAIN` - домен мини-приложения и webhook (например, `mini.example.com`)
+- `USE_BUILTIN_NGINX` - `true`, если нужно поднять встроенный nginx с автоматическим SSL; `false`, если используете свой reverse proxy
+- `CERTBOT_EMAIL` - email для Let's Encrypt (нужен только если `USE_BUILTIN_NGINX=true`)
 
 ### Подключение Groq (ИИ-поддержка)
 
@@ -63,18 +64,30 @@ cp .env.example .env
 
 Альтернативный провайдер — **Gemini**: задайте `AI_PROVIDER=gemini` (или `AI_SUPPORT_API_TYPE=gemini`) и укажите `GEMINI_API_KEY` и `GEMINI_MODEL` в `.env`.
 
-### 3. Запуск через docker-compose (рекомендуется: бот + мини-приложение + nginx + SSL)
+### 3. Запуск через docker-compose
 
-На сервере должен быть открыт порт 80 и 443, домен `MINI_APP_DOMAIN` должен указывать на IP сервера.
+Запуск выполняется через helper-скрипт, который читает `USE_BUILTIN_NGINX` из `.env` и сам включает нужный compose-профиль.
 
 ```bash
-# В .env укажите реальный email для CERTBOT_EMAIL
-docker compose up -d --build
+./compose.sh up -d --build
 ```
 
-При первом запуске nginx автоматически получит SSL-сертификат Let's Encrypt для домена из `MINI_APP_DOMAIN`. Продление сертификата выполняется по крону раз в сутки.
+Если `USE_BUILTIN_NGINX=true`:
 
-Мини-приложение будет доступно по адресу `https://<MINI_APP_DOMAIN>`. В боте кнопка «Приложение» и кнопка в /start откроют этот URL.
+- на сервере должны быть открыты порты `80` и `443`
+- домен `MINI_APP_DOMAIN` должен указывать на IP сервера
+- при первом запуске встроенный nginx автоматически получит SSL-сертификат Let's Encrypt для домена из `MINI_APP_DOMAIN`
+- продление сертификата выполняется по крону раз в сутки
+
+Если `USE_BUILTIN_NGINX=false`:
+
+- встроенный nginx-контейнер не запускается
+- мини-приложение и webhook будут доступны на `127.0.0.1:8080`
+- используйте свой nginx/Caddy/reverse proxy с проксированием на `http://127.0.0.1:8080`
+- пример конфига лежит в `nginx/external.conf.example`
+- если внешний URL для webhook отличается от `MINI_APP_DOMAIN`, задайте `PAYMENTS_BASE_URL`
+
+В обоих режимах кнопка «Приложение» в боте ведёт на `https://<MINI_APP_DOMAIN>`, поэтому `MINI_APP_DOMAIN` должен совпадать с вашим внешним доменом.
 
 ### 4. Запуск в Docker (только бот)
 
@@ -171,9 +184,11 @@ remnawave-manager-bot/
 ├── bot.py              # Основной файл бота
 ├── requirements.txt    # Зависимости Python
 ├── Dockerfile          # Docker образ бота
-├── docker-compose.yml  # Бот + мини-приложение + nginx
+├── compose.sh          # Запуск docker compose с учётом USE_BUILTIN_NGINX
+├── docker-compose.yml  # Бот + мини-приложение + встроенный nginx (через profile)
 ├── nginx/              # Nginx + Certbot (SSL)
 │   ├── Dockerfile
+│   ├── external.conf.example
 │   ├── nginx.conf.template
 │   └── entrypoint.sh
 ├── mini-app/           # Мини-приложение для менеджеров
