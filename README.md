@@ -40,6 +40,32 @@ cp .env.example .env
 - `MINI_APP_DOMAIN` - домен мини-приложения (например, `mini.stealthnet.app` УТОЧНЕНИЕ - ставить на чистый сервер или рядом с панелью но тогда без мини апп) 
 - `CERTBOT_EMAIL` - email для Let's Encrypt (нужен для автоматического SSL при запуске nginx)
 
+### Платежи
+
+Бот автоматически включает все провайдеры, для которых заданы корректные ключи в `.env`.
+
+- если заданы только ключи `Freekassa` — будет доступен только `Freekassa`
+- если заданы только ключи `Platega` — будет доступен только `Platega`
+- если заданы ключи обоих провайдеров — менеджер сможет выбрать нужный вариант при выставлении счёта
+
+Для `Platega` задайте:
+
+- `PLATEGA_MERCHANT_ID` - merchant id из кабинета Platega
+- `PLATEGA_SECRET` - secret из кабинета Platega
+- `PLATEGA_PAYMENT_METHOD` - метод оплаты Platega, по умолчанию `2` (`2` = СБП, `11` = карты, `12` = international, `13` = crypto)
+
+Опционально можно задать порядок показа через:
+
+- `PAYMENT_PROVIDER=platega,freekassa`
+
+Если переменная не задана, порядок по умолчанию: `Freekassa`, затем `Platega`.
+
+Для работы webhook:
+
+- callback URL в кабинете Platega должен указывать на `https://<ваш_домен>/webhook/platega`
+- для Freekassa остаются `FREEEKASSA_API_KEY`, `FREEEKASSA_SHOP_ID`, `FREEEKASSA_WEBHOOK_SECRET`
+- `PAYMENTS_BASE_URL` можно указать явно, если домен webhook отличается от `MINI_APP_DOMAIN`
+
 ### Подключение Groq (ИИ-поддержка)
 
 Бот может автоматически отвечать клиентам в поддержке с помощью ИИ (Groq по умолчанию). Чтобы включить:

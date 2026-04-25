@@ -15,6 +15,17 @@ nano .env  # или используйте любой редактор
 - `REMNAWAVE_API_TOKEN` - токен авторизации для API
 - `ALLOWED_MANAGER_IDS` - ID менеджеров через запятую (например: `123456789,987654321`)
 
+Если используете `Platega`, дополнительно задайте:
+- `PLATEGA_MERCHANT_ID`
+- `PLATEGA_SECRET`
+- `PLATEGA_PAYMENT_METHOD=2`
+
+И настройте callback URL в кабинете Platega на:
+- `https://<ваш_домен>/webhook/platega`
+
+Если заданы ключи и `Freekassa`, и `Platega`, бот покажет оба варианта при выставлении счёта.
+Опционально можно задать порядок через `PAYMENT_PROVIDER=platega,freekassa`.
+
 ## 2. Запуск через Docker Compose (рекомендуется)
 
 ```bash

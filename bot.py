@@ -32,12 +32,16 @@ from telegram.ext import (
 )
 
 try:
-    from payments.freekassa import get_freekassa_provider
-    from payments.storage import pending_add
+    from payments import (
+        get_available_payment_providers,
+        get_payment_provider_by_name,
+        pending_add,
+    )
     _PAYMENTS_AVAILABLE = True
 except ImportError:
     _PAYMENTS_AVAILABLE = False
-    get_freekassa_provider = None
+    get_available_payment_providers = None
+    get_payment_provider_by_name = None
     pending_add = None
 
 try:
@@ -75,6 +79,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+PAYMENT_PROVIDER_LABELS = {
+    "freekassa": "Freekassa",
+    "platega": "Platega",
+}
 
 # Конфигурация из переменных окружения
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -218,6 +226,159 @@ def _clear_awaiting_invoice(context: ContextTypes.DEFAULT_TYPE, manager_id: int)
         by_manager = bot_data.get("awaiting_invoice_by_manager")
         if by_manager is not None and manager_id in by_manager:
             del by_manager[manager_id]
+
+
+def _store_awaiting_invoice(context: ContextTypes.DEFAULT_TYPE, manager_id: int, payload: dict) -> None:
+    context.user_data["awaiting_invoice"] = payload
+    _set_awaiting_invoice_by_manager(context, manager_id, payload)
+
+
+def _payment_provider_label(name: str) -> str:
+    return PAYMENT_PROVIDER_LABELS.get((name or "").strip().lower(), (name or "").strip() or "Провайдер")
+
+
+async def _send_chat_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    thread_id: Optional[int] = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    kwargs = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+    await context.bot.send_message(**kwargs)
+
+
+async def _prompt_invoice_amount(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    thread_id: Optional[int] = None,
+) -> None:
+    await _send_chat_text(
+        context,
+        chat_id,
+        "💰 <b>Выставить счёт</b>\n\nВведите сумму в рублях (число):",
+        thread_id=thread_id,
+    )
+
+
+async def _prompt_invoice_provider_choice(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    amount: float,
+    providers: List[Any],
+    thread_id: Optional[int] = None,
+) -> None:
+    rows = [
+        [InlineKeyboardButton(f"💳 {_payment_provider_label(provider.name)}", callback_data=f"invp:{provider.name}")]
+        for provider in providers
+    ]
+    await _send_chat_text(
+        context,
+        chat_id,
+        (
+            "💳 <b>Выберите провайдера оплаты</b>\n\n"
+            f"Сумма: <b>{amount:.2f} ₽</b>\n\n"
+            "Если нужно, можно отправить новую сумму сообщением."
+        ),
+        thread_id=thread_id,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _create_invoice_for_provider(
+    context: ContextTypes.DEFAULT_TYPE,
+    provider: Any,
+    awaiting: dict,
+    amount: float,
+    manager_chat_id: int,
+    thread_id: Optional[int] = None,
+) -> bool:
+    client_id = awaiting.get("client_id")
+    manager_id = awaiting.get("manager_id")
+    user_uuid = awaiting.get("user_uuid")
+    provider_label = _payment_provider_label(getattr(provider, "name", ""))
+    payment_id = f"rmb_{int(time.time() * 1000)}_{client_id or manager_id}"
+    email = f"{client_id}@telegram.org" if client_id else f"{manager_id}@telegram.org"
+    base_url = (os.getenv("PAYMENTS_BASE_URL") or os.getenv("MINI_APP_DOMAIN") or "").strip()
+    if base_url:
+        if base_url.startswith("https:/") and not base_url.startswith("https://"):
+            base_url = "https://" + base_url[7:]
+        elif base_url.startswith("http:/") and not base_url.startswith("http://"):
+            base_url = "http://" + base_url[6:]
+        elif "://" not in base_url:
+            base_url = "https://" + base_url
+    base_url = base_url.rstrip("/") if base_url else ""
+    notification_url = f"{base_url}/webhook/{provider.name}" if base_url else None
+    return_url = (os.getenv("PLATEGA_RETURN_URL") or (base_url or "")).strip() or None
+    failed_url = (os.getenv("PLATEGA_FAILED_URL") or return_url or (base_url or "")).strip() or None
+    result = provider.create_invoice(
+        amount=amount,
+        currency="RUB",
+        payment_id=payment_id,
+        email=email,
+        ip="127.0.0.1",
+        client_id=client_id or 0,
+        manager_id=manager_id,
+        user_uuid=user_uuid,
+        notification_url=notification_url,
+        return_url=return_url,
+        failed_url=failed_url,
+        description=f"Оплата доступа {SERVICE_NAME} #{payment_id}",
+    )
+    if not result.success:
+        await _send_chat_text(
+            context,
+            manager_chat_id,
+            f"Ошибка создания счёта через <b>{provider_label}</b>: {result.error or 'неизвестно'}.",
+            thread_id=thread_id,
+        )
+        return False
+    if pending_add:
+        pending_add(
+            payment_id=payment_id,
+            manager_id=manager_id,
+            client_id=client_id if client_id is not None else 0,
+            amount=amount,
+            currency="RUB",
+            user_uuid=user_uuid,
+            provider=provider.name,
+            external_id=result.external_id,
+        )
+    if client_id and result.payment_url:
+        try:
+            await context.bot.send_message(
+                chat_id=client_id,
+                text=f"💰 <b>Счёт на оплату</b>\n\nСумма: <b>{amount:.2f} ₽</b>\n\nОплатить: {result.payment_url}",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning("send invoice link to client: %s", e)
+    if result.payment_url:
+        await _send_chat_text(
+            context,
+            manager_chat_id,
+            (
+                f"✅ Счёт на <b>{amount:.2f} ₽</b> выставлен через <b>{provider_label}</b>.\n\n"
+                + ("Ссылка отправлена клиенту." if client_id else f"Ссылка для клиента: {result.payment_url}")
+            ),
+            thread_id=thread_id,
+        )
+    else:
+        await _send_chat_text(
+            context,
+            manager_chat_id,
+            f"Счёт через <b>{provider_label}</b> создан, но ссылка не получена.",
+            thread_id=thread_id,
+        )
+    return True
 
 
 def format_bytes(bytes_value: int) -> str:
@@ -1032,14 +1193,9 @@ async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "manager_id": manager_id,
             "user_uuid": user.get("uuid"),
         }
-        context.user_data["awaiting_invoice"] = payload
-        _set_awaiting_invoice_by_manager(context, manager_id, payload)
+        _store_awaiting_invoice(context, manager_id, payload)
         try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="💰 <b>Выставить счёт</b>\n\nВведите сумму в рублях (число):",
-                parse_mode="HTML",
-            )
+            await _prompt_invoice_amount(context, update.effective_chat.id)
         except Exception as e:
             logger.warning("send invoice prompt to manager: %s", e)
         return
@@ -1751,15 +1907,11 @@ async def support_card_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 "manager_id": manager_id,
                 "user_uuid": user_uuid,
             }
-            context.user_data["awaiting_invoice"] = payload
-            _set_awaiting_invoice_by_manager(context, manager_id, payload)
+            _store_awaiting_invoice(context, manager_id, payload)
             try:
                 chat_id = update.effective_chat.id
                 thread_id = getattr(query.message, "message_thread_id", None)
-                kwargs = {"chat_id": chat_id, "text": "💰 <b>Выставить счёт</b>\n\nВведите сумму в рублях (число):", "parse_mode": "HTML"}
-                if thread_id:
-                    kwargs["message_thread_id"] = thread_id
-                await context.bot.send_message(**kwargs)
+                await _prompt_invoice_amount(context, chat_id, thread_id=thread_id)
             except Exception as e:
                 logger.warning("send invoice prompt to manager: %s", e)
             return
@@ -2108,79 +2260,66 @@ async def _handle_invoice_amount(update: Update, context: ContextTypes.DEFAULT_T
     awaiting = _get_awaiting_invoice(context, manager_id)
     if not awaiting:
         return False
+    providers = get_available_payment_providers() if (_PAYMENTS_AVAILABLE and get_available_payment_providers) else []
+    if not providers:
+        _clear_awaiting_invoice(context, manager_id)
+        await update.message.reply_text("Нет ни одного настроенного провайдера оплаты. Проверьте ключи в .env.")
+        return True
     text = (update.message.text or "").strip()
+    stage = (awaiting.get("stage") or "amount").strip().lower()
     try:
         amount = float(text.replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Введите число (сумму в рублях).")
+        if stage == "provider":
+            await update.message.reply_text("Выберите провайдера кнопкой ниже или отправьте новую сумму числом.")
+        else:
+            await update.message.reply_text("Введите число (сумму в рублях).")
         return True
     if amount <= 0:
         await update.message.reply_text("Сумма должна быть больше 0.")
         return True
-    _clear_awaiting_invoice(context, manager_id)
-    client_id = awaiting.get("client_id")
-    manager_id = awaiting.get("manager_id")
-    user_uuid = awaiting.get("user_uuid")
-    if not _PAYMENTS_AVAILABLE or not get_freekassa_provider:
-        await update.message.reply_text("Платёжная система не настроена (Freekassa).")
+    chat_id = update.effective_chat.id
+    thread_id = getattr(update.message, "message_thread_id", None)
+    if len(providers) > 1:
+        awaiting["amount"] = amount
+        awaiting["stage"] = "provider"
+        _store_awaiting_invoice(context, manager_id, awaiting)
+        await _prompt_invoice_provider_choice(context, chat_id, amount, providers, thread_id=thread_id)
         return True
-    provider = get_freekassa_provider()
-    if not provider:
-        await update.message.reply_text("Платёжная система не настроена (Freekassa API key / shop ID).")
-        return True
-    payment_id = f"rmb_{int(time.time() * 1000)}_{client_id or manager_id}"
-    email = f"{client_id}@telegram.org" if client_id else f"{manager_id}@telegram.org"
-    base_url = (os.getenv("PAYMENTS_BASE_URL") or os.getenv("MINI_APP_DOMAIN") or "").strip()
-    if base_url:
-        if base_url.startswith("https:/") and not base_url.startswith("https://"):
-            base_url = "https://" + base_url[7:]
-        elif base_url.startswith("http:/") and not base_url.startswith("http://"):
-            base_url = "http://" + base_url[6:]
-        elif "://" not in base_url:
-            base_url = "https://" + base_url
-    notification_url = f"{base_url.rstrip('/')}/webhook/freekassa" if base_url else None
-    result = provider.create_invoice(
-        amount=amount,
-        currency="RUB",
-        payment_id=payment_id,
-        email=email,
-        ip="127.0.0.1",
-        client_id=client_id or 0,
-        manager_id=manager_id,
-        user_uuid=user_uuid,
-        notification_url=notification_url,
-    )
-    if not result.success:
-        await update.message.reply_text(f"Ошибка создания счёта: {result.error or 'неизвестно'}.")
-        return True
-    if pending_add:
-        pending_add(
-            payment_id=payment_id,
-            manager_id=manager_id,
-            client_id=client_id if client_id is not None else 0,
-            amount=amount,
-            currency="RUB",
-            user_uuid=user_uuid,
-            provider="freekassa",
-        )
-    if client_id and result.payment_url:
-        try:
-            await context.bot.send_message(
-                chat_id=client_id,
-                text=f"💰 <b>Счёт на оплату</b>\n\nСумма: <b>{amount:.2f} ₽</b>\n\nОплатить: {result.payment_url}",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.warning("send invoice link to client: %s", e)
-    if result.payment_url:
-        await update.message.reply_text(
-            f"✅ Счёт на <b>{amount:.2f} ₽</b> выставлен.\n\n"
-            + ("Ссылка отправлена клиенту." if client_id else f"Ссылка для клиента: {result.payment_url}"),
-            parse_mode="HTML",
-        )
-    else:
-        await update.message.reply_text("Счёт создан, но ссылка не получена.")
+    success = await _create_invoice_for_provider(context, providers[0], awaiting, amount, chat_id, thread_id=thread_id)
+    if success:
+        _clear_awaiting_invoice(context, manager_id)
     return True
+
+
+async def invoice_provider_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор провайдера оплаты после ввода суммы."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if not check_access(user_id):
+        await query.answer("Доступ запрещён.", show_alert=True)
+        return
+    provider_name = (query.data.split(":", 1)[1] if ":" in query.data else "").strip().lower()
+    awaiting = _get_awaiting_invoice(context, user_id)
+    if not awaiting:
+        await query.answer("Состояние выставления счёта потеряно. Начните заново.", show_alert=True)
+        return
+    amount_raw = awaiting.get("amount")
+    try:
+        amount = float(amount_raw)
+    except (TypeError, ValueError):
+        await query.answer("Сначала введите сумму счёта.", show_alert=True)
+        return
+    provider = get_payment_provider_by_name(provider_name) if (_PAYMENTS_AVAILABLE and get_payment_provider_by_name) else None
+    if not provider:
+        await query.answer("Этот провайдер сейчас не настроен.", show_alert=True)
+        return
+    await query.answer(f"{_payment_provider_label(provider.name)}...")
+    chat_id = update.effective_chat.id
+    thread_id = getattr(query.message, "message_thread_id", None)
+    success = await _create_invoice_for_provider(context, provider, awaiting, amount, chat_id, thread_id=thread_id)
+    if success:
+        _clear_awaiting_invoice(context, user_id)
 
 
 async def dispatch_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2363,6 +2502,7 @@ def main():
     application.add_handler(CallbackQueryHandler(call_manager_callback, pattern="^call_manager$"))
     application.add_handler(CallbackQueryHandler(client_close_ticket_callback, pattern="^client_close_ticket$"))
     application.add_handler(CallbackQueryHandler(squad_assign_callback, pattern="^squad"))
+    application.add_handler(CallbackQueryHandler(invoice_provider_callback, pattern="^invp:"))
     application.add_handler(CallbackQueryHandler(action_callback, pattern="^(act:|hwid_del:)"))
     application.add_handler(CallbackQueryHandler(button_callback, pattern="^s:"))
     # Текст, фото, документы и т.д. в группе поддержки (топики)

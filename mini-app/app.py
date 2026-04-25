@@ -26,13 +26,33 @@ ALLOWED_MANAGER_IDS = set(
     int(x.strip()) for x in (os.getenv("ALLOWED_MANAGER_IDS", "") or "").split(",") if x.strip()
 )
 
-# Freekassa webhook
+# Payment webhooks
 FREEEKASSA_WEBHOOK_SECRET = (os.getenv("FREEEKASSA_WEBHOOK_SECRET") or "").strip()
 FREEEKASSA_ALLOWED_IPS = {
     "168.119.157.136",
     "168.119.60.227",
     "178.154.197.79",
     "51.250.54.238",
+}
+PLATEGA_SUCCESS_STATUSES = {
+    "APPROVED",
+    "COMPLETED",
+    "CONFIRMED",
+    "PAID",
+    "SUCCESS",
+    "SUCCEEDED",
+    "SUCCESSFUL",
+}
+PLATEGA_FAILED_STATUSES = {
+    "CANCELED",
+    "CANCELLED",
+    "CHARGEBACK",
+    "CHARGEBACKED",
+    "DECLINED",
+    "ERROR",
+    "EXPIRED",
+    "FAILED",
+    "REJECTED",
 }
 PAYMENTS_DATA_DIR = Path(os.getenv("PAYMENTS_DATA_DIR", "/data"))
 _PENDING_FILE = PAYMENTS_DATA_DIR / "payments_pending.json"
@@ -150,59 +170,136 @@ def api_delete_all_hwid(user_uuid: str):
     return r.status_code == 200, r.json() if r.content else {}
 
 
-def _payments_pending_pop(payment_id: str):
-    """Удаляет запись об ожидающем платеже и возвращает её (manager_id, amount, ...)."""
+def _load_pending_data() -> dict:
     _PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not _PENDING_FILE.exists():
-        return None
+        return {}
     try:
         with open(_PENDING_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            return json.load(f)
     except Exception as e:
         logger.warning("payments pending load: %s", e)
+        return {}
+
+
+def _save_pending_data(data: dict) -> None:
+    try:
+        with open(_PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=0)
+    except Exception as e:
+        logger.warning("payments pending save: %s", e)
+
+
+def _payments_pending_pop_candidates(*candidate_ids: str):
+    """Удаляет запись об ожидающем платеже по payment_id или external_id."""
+    candidates = {str(item).strip() for item in candidate_ids if str(item).strip()}
+    if not candidates:
         return None
-    record = data.pop(payment_id, None)
+    data = _load_pending_data()
+    matched_key = next((candidate for candidate in candidates if candidate in data), None)
+    if matched_key is None:
+        for key, value in data.items():
+            external_id = str((value or {}).get("external_id") or "").strip()
+            if external_id and external_id in candidates:
+                matched_key = key
+                break
+    if matched_key is None:
+        return None
+    record = data.pop(matched_key, None)
     if record is not None:
-        try:
-            with open(_PENDING_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=0)
-        except Exception as e:
-            logger.warning("payments pending save: %s", e)
+        _save_pending_data(data)
     return record
 
 
-@app.route("/webhook/freekassa", methods=["GET", "POST"])
-def webhook_freekassa():
-    """Вебхук Freekassa: оповещение об оплате. Проверка подписи и IP, уведомление менеджеру в Telegram."""
-    remote_ip = (
-        request.headers.get("X-Real-IP")
-        or (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-        or request.remote_addr
+def _pick_first_string(*values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (int, float)) and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _get_platega_payload():
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+    raw = (request.get_data(cache=True) or b"").decode("utf-8", errors="ignore").strip()
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except Exception:
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _parse_platega_webhook():
+    data = _get_platega_payload()
+    if not data:
+        return None
+    tx_obj = data.get("transaction") if isinstance(data.get("transaction"), dict) else {}
+    nested_obj = data.get("data") if isinstance(data.get("data"), dict) else {}
+    status_raw = _pick_first_string(
+        data.get("status"),
+        tx_obj.get("status"),
+        data.get("state"),
+        data.get("paymentStatus"),
+        data.get("payment_status"),
+        nested_obj.get("status"),
+        nested_obj.get("state"),
     )
-    if remote_ip and remote_ip not in FREEEKASSA_ALLOWED_IPS:
-        logger.warning("Freekassa webhook from disallowed IP: %s", remote_ip)
-        return "invalid ip", 403
-    merchant_id = request.values.get("MERCHANT_ID")
-    amount = request.values.get("AMOUNT")
-    merchant_order_id = request.values.get("MERCHANT_ORDER_ID")
-    sign = request.values.get("SIGN")
-    if not all([merchant_id, amount, merchant_order_id, sign]):
-        return "missing params", 400
-    if not FREEEKASSA_WEBHOOK_SECRET:
-        return "not configured", 500
-    expected = hashlib.md5(
-        f"{merchant_id}:{amount}:{FREEEKASSA_WEBHOOK_SECRET}:{merchant_order_id}".encode()
-    ).hexdigest()
-    if sign.lower() != expected.lower():
-        return "wrong sign", 400
-    record = _payments_pending_pop(merchant_order_id)
-    if not record:
-        logger.info("Freekassa webhook: unknown or already processed order %s", merchant_order_id)
-        return "YES", 200
+    status = (status_raw or "").upper()
+    transaction_id = _pick_first_string(
+        data.get("id"),
+        tx_obj.get("id"),
+        data.get("transactionId"),
+        data.get("transaction_id"),
+        nested_obj.get("id"),
+        nested_obj.get("transactionId"),
+        nested_obj.get("transaction_id"),
+    )
+    external_id = _pick_first_string(
+        data.get("externalId"),
+        tx_obj.get("externalId"),
+        nested_obj.get("externalId"),
+        data.get("invoiceId"),
+        tx_obj.get("invoiceId"),
+        nested_obj.get("invoiceId"),
+    )
+    order_id = _pick_first_string(
+        data.get("orderId"),
+        data.get("order_id"),
+        data.get("order"),
+        data.get("merchant_order_id"),
+        nested_obj.get("orderId"),
+        nested_obj.get("order_id"),
+        nested_obj.get("order"),
+    )
+    payload_id = _pick_first_string(
+        data.get("payload"),
+        tx_obj.get("payload"),
+        nested_obj.get("payload"),
+    )
+    candidate_ids = []
+    for value in (payload_id, transaction_id, external_id, order_id):
+        if value and value not in candidate_ids:
+            candidate_ids.append(value)
+    return {
+        "status": status,
+        "transaction_id": transaction_id,
+        "external_id": external_id,
+        "order_id": order_id,
+        "payload_id": payload_id,
+        "candidate_ids": candidate_ids,
+    }
+
+
+def _process_paid_record(record, amount_value, provider_label: str):
     manager_id = record.get("manager_id")
     client_id = record.get("client_id")
     user_uuid = (record.get("user_uuid") or "").strip()
-    amount_val = record.get("amount", amount)
+    amount_val = record.get("amount", amount_value)
 
     # После успешной оплаты: разблокировка клиента и перевыпуск подписки
     unblock_ok = revoke_ok = False
@@ -211,9 +308,9 @@ def webhook_freekassa():
         if unblock_ok:
             revoke_ok, _ = api_revoke_user_subscription(user_uuid)
         if not unblock_ok:
-            logger.warning("Freekassa webhook: api_enable_user failed for uuid %s", user_uuid)
+            logger.warning("%s webhook: api_enable_user failed for uuid %s", provider_label, user_uuid)
         elif not revoke_ok:
-            logger.warning("Freekassa webhook: api_revoke_user_subscription failed for uuid %s", user_uuid)
+            logger.warning("%s webhook: api_revoke_user_subscription failed for uuid %s", provider_label, user_uuid)
 
     # Уведомление клиенту, что он разблокирован
     if client_id and BOT_TOKEN and (unblock_ok or revoke_ok):
@@ -233,7 +330,7 @@ def webhook_freekassa():
                 timeout=10,
             )
         except Exception as e:
-            logger.warning("Freekassa webhook: notify client %s: %s", client_id, e)
+            logger.warning("%s webhook: notify client %s: %s", provider_label, client_id, e)
 
     # Уведомление менеджеру
     if manager_id and BOT_TOKEN:
@@ -261,10 +358,67 @@ def webhook_freekassa():
                 timeout=10,
             )
             if r.status_code != 200:
-                logger.warning("Freekassa webhook: sendMessage %s %s", r.status_code, r.text)
+                logger.warning("%s webhook: sendMessage %s %s", provider_label, r.status_code, r.text)
         except Exception as e:
-            logger.exception("Freekassa webhook: notify manager: %s", e)
+            logger.exception("%s webhook: notify manager: %s", provider_label, e)
+
+
+@app.route("/webhook/freekassa", methods=["GET", "POST"])
+def webhook_freekassa():
+    """Вебхук Freekassa: проверка подписи/IP и единая post-payment обработка."""
+    remote_ip = (
+        request.headers.get("X-Real-IP")
+        or (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        or request.remote_addr
+    )
+    if remote_ip and remote_ip not in FREEEKASSA_ALLOWED_IPS:
+        logger.warning("Freekassa webhook from disallowed IP: %s", remote_ip)
+        return "invalid ip", 403
+    merchant_id = request.values.get("MERCHANT_ID")
+    amount = request.values.get("AMOUNT")
+    merchant_order_id = request.values.get("MERCHANT_ORDER_ID")
+    sign = request.values.get("SIGN")
+    if not all([merchant_id, amount, merchant_order_id, sign]):
+        return "missing params", 400
+    if not FREEEKASSA_WEBHOOK_SECRET:
+        return "not configured", 500
+    expected = hashlib.md5(
+        f"{merchant_id}:{amount}:{FREEEKASSA_WEBHOOK_SECRET}:{merchant_order_id}".encode()
+    ).hexdigest()
+    if sign.lower() != expected.lower():
+        return "wrong sign", 400
+    record = _payments_pending_pop_candidates(merchant_order_id)
+    if not record:
+        logger.info("Freekassa webhook: unknown or already processed order %s", merchant_order_id)
+        return "YES", 200
+    _process_paid_record(record, amount, "Freekassa")
     return "YES", 200
+
+
+@app.route("/webhook/platega", methods=["POST"])
+def webhook_platega():
+    """Вебхук Platega: ищем payload/order/transaction и запускаем ту же post-payment логику."""
+    parsed = _parse_platega_webhook()
+    if not parsed:
+        logger.warning("Platega webhook: empty or invalid body")
+        return jsonify({"received": True}), 200
+    candidate_ids = parsed["candidate_ids"]
+    status = parsed["status"]
+    if not candidate_ids:
+        logger.warning("Platega webhook: no identifiers in payload")
+        return jsonify({"received": True}), 200
+    if status in PLATEGA_FAILED_STATUSES:
+        logger.info("Platega webhook: failed status=%s ids=%s", status, candidate_ids)
+        return jsonify({"received": True}), 200
+    if status not in PLATEGA_SUCCESS_STATUSES:
+        logger.info("Platega webhook: ignored status=%s ids=%s", status, candidate_ids)
+        return jsonify({"received": True}), 200
+    record = _payments_pending_pop_candidates(*candidate_ids)
+    if not record:
+        logger.info("Platega webhook: unknown or already processed ids=%s", candidate_ids)
+        return jsonify({"received": True}), 200
+    _process_paid_record(record, record.get("amount"), "Platega")
+    return jsonify({"received": True}), 200
 
 
 @app.route("/")
@@ -364,28 +518,6 @@ def action_hwid_delete():
         return jsonify({"ok": False, "error": "userUuid_and_hwid_required"}), 400
     ok, _ = api_delete_hwid_device(user_uuid, hwid)
     return jsonify({"ok": ok, "message": "Устройство удалено." if ok else "Ошибка API"})
-
-
-def _payments_pending_pop(payment_id: str):
-    """Удаляет запись об ожидающем платеже и возвращает её (manager_id, amount, ...)."""
-    _PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not _PENDING_FILE.exists():
-        return None
-    try:
-        with open(_PENDING_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        logger.warning("payments pending load: %s", e)
-        return None
-    record = data.pop(payment_id, None)
-    if record is not None:
-        try:
-            with open(_PENDING_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=0)
-        except Exception as e:
-            logger.warning("payments pending save: %s", e)
-    return record
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))

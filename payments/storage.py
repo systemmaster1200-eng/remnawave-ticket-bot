@@ -44,6 +44,7 @@ def pending_add(
     currency: str,
     user_uuid: Optional[str] = None,
     provider: str = "freekassa",
+    external_id: Optional[str] = None,
 ) -> None:
     data = _load()
     data[payment_id] = {
@@ -53,6 +54,7 @@ def pending_add(
         "currency": currency,
         "user_uuid": user_uuid,
         "provider": provider,
+        "external_id": external_id,
     }
     _save(data)
 
@@ -67,3 +69,23 @@ def pending_pop(payment_id: str) -> Optional[Dict[str, Any]]:
 
 def pending_get(payment_id: str) -> Optional[Dict[str, Any]]:
     return _load().get(payment_id)
+
+
+def pending_pop_candidates(*candidate_ids: str) -> Optional[Dict[str, Any]]:
+    candidates = {str(item).strip() for item in candidate_ids if str(item).strip()}
+    if not candidates:
+        return None
+    data = _load()
+    matched_key = next((candidate for candidate in candidates if candidate in data), None)
+    if matched_key is None:
+        for key, value in data.items():
+            external_id = str((value or {}).get("external_id") or "").strip()
+            if external_id and external_id in candidates:
+                matched_key = key
+                break
+    if matched_key is None:
+        return None
+    record = data.pop(matched_key, None)
+    if record is not None:
+        _save(data)
+    return record

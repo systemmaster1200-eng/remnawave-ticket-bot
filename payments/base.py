@@ -10,6 +10,7 @@ class InvoiceResult:
     success: bool
     payment_id: Optional[str] = None
     payment_url: Optional[str] = None
+    external_id: Optional[str] = None
     error: Optional[str] = None
 
 
